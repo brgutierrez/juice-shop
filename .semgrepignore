@@ -1,0 +1,15 @@
+# Al crear este fichero se sustituyen las exclusiones por defecto de Semgrep,
+# así que se repiten las habituales.
+node_modules/
+build/
+dist/
+frontend/dist/
+frontend/.angular/
+coverage/
+# Pruebas automáticas: no forman parte de la aplicación desplegada
+test/
+cypress/
+frontend/src/**/*.spec.ts
+# Fragmentos de código de los "coding challenges" de Juice Shop: son variantes
+# (vulnerables y corregidas) que se muestran al usuario, no se ejecutan.
+data/static/codefixes/

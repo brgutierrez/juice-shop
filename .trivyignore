@@ -1,0 +1,8 @@
+# Vulnerabilidades aceptadas o falsos positivos que Trivy debe ignorar.
+# REGLA DEL EQUIPO: cada entrada debe tener (1) justificación, (2) referencia al
+# hallazgo en DefectDojo marcado como "Risk Accepted" o "False Positive" y
+# (3) fecha de caducidad (exp:), para que se revise de nuevo.
+#
+# Ejemplo:
+# Finding DefectDojo #123 · sin parche publicado; el código vulnerable no se usa
+# CVE-2024-00000 exp:2026-12-31

@@ -1,0 +1,439 @@
+# =============================================================================
+#  PAI 4 · Pipeline DevSecOps de referencia para OWASP Juice Shop (GitHub Actions)
+# =============================================================================
+#  Etapas (cada una es un job; los números coinciden con el diagrama 1.a):
+#
+#   COMMIT (en paralelo)                 BUILD          PRUEBAS (en paralelo)       GESTIÓN / ENTREGA
+#   1 secrets  Gitleaks   [aviso]   ┐                ┌ 6 image-scan Trivy [BLOQUEA] ┐
+#   2 sast     Semgrep    [aviso]   ├──► 5 build ───►┤                              ├─► 8 defectdojo (siempre)
+#   3 sca      Trivy fs   [aviso]   │    (imagen)    └ 7 dast  ZAP       [aviso]    ┘   9 deploy (solo si todo OK)
+#   4 iac      Checkov    [BLOQUEA] ┘
+#
+#  Modo aviso  = el paso del quality gate tiene continue-on-error: true
+#                (marca el hallazgo, pero el pipeline sigue).
+#  Bloqueante  = sin continue-on-error: si se supera el umbral, el job falla
+#                y los jobs que dependen de él (needs) no se ejecutan.
+#
+#  Secretos necesarios (Settings → Secrets and variables → Actions):
+#    DD_URL      URL pública de DefectDojo, p. ej. https://xxxx.trycloudflare.com
+#    DD_API_KEY  clave de la API v2 de DefectDojo
+#  Variable opcional: DD_PRODUCT_TYPE (p. ej. PAI4-ST7)
+#
+#  Las acciones se fijan por SHA de commit (no por etiqueta) para que nadie
+#  pueda cambiar su código moviendo la etiqueta: es exactamente el ataque que
+#  sufrió aquasecurity/trivy-action en marzo de 2026.
+# =============================================================================
+
+name: DevSecOps
+
+# Juice Shop usa "master" como rama principal; se recomienda renombrarla a "main"
+# en el fork (Settings → General → Default branch). Se aceptan las dos.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# Mínimo privilegio: el GITHUB_TOKEN solo puede leer el repositorio,
+# salvo en el job de publicación, que añade packages: write.
+permissions:
+  contents: read
+
+# Si llegan dos push seguidos a la misma rama, se cancela la ejecución antigua.
+concurrency:
+  group: devsecops-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Versiones fijadas de las herramientas (reproducibilidad y cadena de suministro)
+  GITLEAKS_IMAGE: ghcr.io/gitleaks/gitleaks:v8.30.1
+  TRIVY_IMAGE: aquasec/trivy:0.76.2
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:stable
+  SEMGREP_VERSION: "1.184.0"
+  CHECKOV_VERSION: "3.4.3"
+  # Umbrales de los quality gates (aparecen también en el diagrama 1.a)
+  GATE_SECRETS_MAX: "0"        # nº máximo de secretos
+  GATE_SAST_MAX_ERROR: "0"     # nº máximo de hallazgos Semgrep de severidad ERROR
+  GATE_SCA_MAX_CRITICAL: "0"   # nº máximo de CVE críticas en dependencias
+  GATE_DAST_MAX_HIGH: "0"      # nº máximo de alertas ZAP de riesgo alto
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1 · SECRETOS · Gitleaks · modo aviso
+  # ---------------------------------------------------------------------------
+  secrets:
+    name: "1 · Secretos (Gitleaks) · aviso"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Gitleaks · análisis del código
+        run: |
+          mkdir -p reports && chmod 777 reports
+          # "dir" analiza los ficheros actuales; "git" analizaría todo el historial
+          # (más completo, pero en Juice Shop tarda mucho: miles de commits).
+          # --redact: el informe no contiene el secreto en claro.
+          docker run --rm -v "$PWD:/repo" -w /repo "$GITLEAKS_IMAGE" \
+            dir . --redact --no-banner --exit-code 0 \
+            --report-format json --report-path reports/gitleaks.json
+
+      - name: "Quality gate (aviso) · secretos ≤ ${{ env.GATE_SECRETS_MAX }}"
+        continue-on-error: true
+        run: |
+          n=$(jq 'length' reports/gitleaks.json)
+          printf '| Herramienta | Métrica | Valor | Umbral | Modo |\n|---|---|---|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
+          echo "| Gitleaks | secretos | $n | ≤ $GATE_SECRETS_MAX | aviso |" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.[] | "\(.RuleID)\t\(.File):\(.StartLine)"' reports/gitleaks.json | head -20
+          if [ "$n" -gt "$GATE_SECRETS_MAX" ]; then
+            echo "::warning title=Gitleaks::$n posibles secretos en el código (umbral $GATE_SECRETS_MAX)"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-gitleaks
+          path: reports/gitleaks.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 2 · SAST · Semgrep · modo aviso
+  # ---------------------------------------------------------------------------
+  sast:
+    name: "2 · SAST (Semgrep) · aviso"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Semgrep · análisis estático
+        run: |
+          pipx install "semgrep==$SEMGREP_VERSION"
+          mkdir -p reports
+          # Reglas de la comunidad para JavaScript/TypeScript, Node.js y OWASP Top 10.
+          # Las rutas excluidas están en .semgrepignore.
+          semgrep scan \
+            --config p/javascript --config p/typescript \
+            --config p/nodejsscan --config p/owasp-top-ten \
+            --metrics=off --json --output reports/semgrep.json
+
+      - name: "Quality gate (aviso) · hallazgos ERROR ≤ ${{ env.GATE_SAST_MAX_ERROR }}"
+        continue-on-error: true
+        run: |
+          total=$(jq '.results | length' reports/semgrep.json)
+          n=$(jq '[.results[] | select(.extra.severity=="ERROR" or .extra.severity=="CRITICAL" or .extra.severity=="HIGH")] | length' reports/semgrep.json)
+          printf '| Herramienta | Métrica | Valor | Umbral | Modo |\n|---|---|---|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
+          echo "| Semgrep | hallazgos ERROR (de $total) | $n | ≤ $GATE_SAST_MAX_ERROR | aviso |" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.results[] | select(.extra.severity=="ERROR") | "\(.check_id)\t\(.path):\(.start.line)"' reports/semgrep.json | head -20
+          if [ "$n" -gt "$GATE_SAST_MAX_ERROR" ]; then
+            echo "::warning title=Semgrep::$n hallazgos de severidad ERROR (umbral $GATE_SAST_MAX_ERROR)"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-semgrep
+          path: reports/semgrep.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 3 · SCA · Trivy (dependencias npm) · modo aviso
+  # ---------------------------------------------------------------------------
+  sca:
+    name: "3 · SCA (Trivy) · aviso"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generar package-lock.json
+        # Juice Shop NO versiona package-lock.json (.npmrc tiene package-lock=false).
+        # Sin fichero de bloqueo, las herramientas SCA no saben qué versiones exactas
+        # se instalan. Se genera sin descargar paquetes ni ejecutar scripts.
+        run: |
+          npm install --package-lock-only --package-lock=true --ignore-scripts --no-audit --no-fund
+          (cd frontend && npm install --package-lock-only --package-lock=true --ignore-scripts --no-audit --no-fund)
+
+      - name: Trivy · dependencias con CVE conocidas
+        run: |
+          mkdir -p reports && chmod 777 reports
+          docker run --rm -v "$PWD:/src" "$TRIVY_IMAGE" \
+            fs --scanners vuln --format json --output /src/reports/trivy-sca.json \
+            --ignorefile /src/.trivyignore /src
+
+      - name: "Quality gate (aviso) · CVE críticas ≤ ${{ env.GATE_SCA_MAX_CRITICAL }}"
+        continue-on-error: true
+        run: |
+          n=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' reports/trivy-sca.json)
+          h=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' reports/trivy-sca.json)
+          printf '| Herramienta | Métrica | Valor | Umbral | Modo |\n|---|---|---|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
+          echo "| Trivy fs (SCA) | CVE críticas (altas: $h) | $n | ≤ $GATE_SCA_MAX_CRITICAL | aviso |" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") | "\(.VulnerabilityID)\t\(.PkgName)@\(.InstalledVersion) → \(if (.FixedVersion // "") == "" then "sin parche" else .FixedVersion end)"' reports/trivy-sca.json | sort -u | head -20
+          if [ "$n" -gt "$GATE_SCA_MAX_CRITICAL" ]; then
+            echo "::warning title=Trivy SCA::$n CVE críticas en dependencias (umbral $GATE_SCA_MAX_CRITICAL)"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-trivy-sca
+          path: reports/trivy-sca.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 4 · IaC · Checkov · informe completo en aviso + quality gate BLOQUEANTE
+  # ---------------------------------------------------------------------------
+  iac:
+    name: "4 · IaC (Checkov) · BLOQUEANTE"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Instalar Checkov
+        run: pipx install "checkov==$CHECKOV_VERSION"
+
+      - name: Checkov · informe completo (todo el repositorio)
+        # --soft-fail: este paso solo genera el informe para DefectDojo; nunca falla.
+        # Incluye la infraestructura intencionadamente insegura de Juice Shop
+        # (infrastructure/, terraform/) y los propios workflows.
+        run: |
+          mkdir -p reports
+          checkov -d . --framework dockerfile kubernetes terraform github_actions \
+            --skip-path node_modules --skip-path frontend \
+            -o cli -o json --output-file-path console,reports/checkov.json \
+            --soft-fail --compact --quiet
+
+      - name: "Quality gate (BLOQUEANTE) · controles críticos de k8s/ y Dockerfile"
+        # Sin continue-on-error: si falla alguno de estos controles, el job falla
+        # y build (y todo lo que depende de él) no se ejecuta.
+        # Solo se aplica a la infraestructura que despliega el equipo.
+        run: |
+          printf '| Herramienta | Métrica | Valor | Umbral | Modo |\n|---|---|---|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
+          echo "| Checkov | controles críticos k8s/ + Dockerfile | ver log | 0 fallos | BLOQUEANTE |" >> "$GITHUB_STEP_SUMMARY"
+          checkov -d k8s --framework kubernetes --compact --quiet \
+            --check CKV_K8S_16,CKV_K8S_17,CKV_K8S_19,CKV_K8S_20,CKV_K8S_23,CKV_K8S_28,CKV_K8S_37
+          checkov -f Dockerfile --framework dockerfile --compact --quiet \
+            --check CKV_DOCKER_1,CKV_DOCKER_8
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-checkov
+          path: reports/checkov.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 5 · BUILD · imagen Docker de Juice Shop
+  # ---------------------------------------------------------------------------
+  build:
+    name: "5 · Build de la imagen"
+    needs: [secrets, sast, sca, iac]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Construir imagen (con caché de GitHub Actions)
+        # La primera vez tarda 10-15 min (compila el frontend Angular);
+        # con caché, las siguientes son mucho más rápidas.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          tags: juice-shop:ci
+          outputs: type=docker,dest=${{ runner.temp }}/juice-shop.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VCS_REF=${{ github.sha }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}/juice-shop.tar
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # 6 · IMAGEN DE CONTENEDOR · Trivy · quality gate BLOQUEANTE
+  # ---------------------------------------------------------------------------
+  image-scan:
+    name: "6 · Imagen (Trivy) · BLOQUEANTE"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      - name: Trivy · vulnerabilidades de la imagen (SO + librerías)
+        run: |
+          mkdir -p reports && chmod 777 reports
+          docker run --rm -v "${{ runner.temp }}:/img" -v "$PWD:/src" "$TRIVY_IMAGE" \
+            image --input /img/juice-shop.tar --scanners vuln \
+            --ignorefile /src/.trivyignore \
+            --format json --output /src/reports/trivy-image.json
+
+      - name: "Quality gate (BLOQUEANTE) · 0 CVE críticas con parche disponible"
+        # Umbral: CRITICAL y con versión corregida (FixedVersion). Si no hay parche,
+        # bloquear no sirve de nada: se registra en DefectDojo y se acepta el riesgo.
+        run: |
+          n=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" and (.FixedVersion // "") != "")] | length' reports/trivy-image.json)
+          printf '| Herramienta | Métrica | Valor | Umbral | Modo |\n|---|---|---|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
+          echo "| Trivy image | CVE críticas con parche | $n | 0 | BLOQUEANTE |" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL" and (.FixedVersion // "") != "") | "\(.VulnerabilityID)\t\(.PkgName)@\(.InstalledVersion) → \(.FixedVersion)"' reports/trivy-image.json | sort -u
+          if [ "$n" -gt 0 ]; then
+            echo "::error title=Trivy image::$n CVE críticas con parche disponible. Se bloquea la publicación."
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-trivy-image
+          path: reports/trivy-image.json
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 7 · DAST · OWASP ZAP baseline contra la app levantada en el runner · aviso
+  # ---------------------------------------------------------------------------
+  dast:
+    name: "7 · DAST (ZAP) · aviso"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      - name: Desplegar Juice Shop en el entorno de pruebas (contenedor local)
+        run: |
+          docker load -i "${{ runner.temp }}/juice-shop.tar"
+          docker run -d --name juice-shop -p 3000:3000 juice-shop:ci
+          for i in $(seq 1 60); do
+            curl -fs http://localhost:3000/ >/dev/null && { echo "Juice Shop arriba"; exit 0; }
+            sleep 5
+          done
+          docker logs juice-shop; exit 1
+
+      - name: ZAP baseline (escaneo pasivo + spider)
+        # Solo contra localhost: la app del propio equipo (ver «Uso responsable»).
+        # -I: los WARN no hacen fallar el paso; el umbral lo aplica el quality gate.
+        run: |
+          mkdir -p reports && chmod 777 reports
+          cp .zap/rules.tsv reports/rules.tsv
+          docker run --rm --network host -v "$PWD/reports:/zap/wrk:rw" "$ZAP_IMAGE" \
+            zap-baseline.py -t http://localhost:3000 -c rules.tsv -j -m 3 -I \
+            -J zap.json -x zap.xml -r zap.html
+
+      - name: "Quality gate (aviso) · alertas de riesgo alto ≤ ${{ env.GATE_DAST_MAX_HIGH }}"
+        continue-on-error: true
+        run: |
+          n=$(jq '[.site[]?.alerts[]? | select(.riskcode=="3")] | length' reports/zap.json)
+          m=$(jq '[.site[]?.alerts[]? | select(.riskcode=="2")] | length' reports/zap.json)
+          printf '| Herramienta | Métrica | Valor | Umbral | Modo |\n|---|---|---|---|---|\n' >> "$GITHUB_STEP_SUMMARY"
+          echo "| ZAP baseline | alertas altas (medias: $m) | $n | ≤ $GATE_DAST_MAX_HIGH | aviso |" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.site[]?.alerts[]? | "\(.riskdesc)\t\(.name)"' reports/zap.json | sort -u
+          if [ "$n" -gt "$GATE_DAST_MAX_HIGH" ]; then
+            echo "::warning title=ZAP::$n alertas de riesgo alto (umbral $GATE_DAST_MAX_HIGH)"
+            exit 1
+          fi
+
+      - name: Guardar log de la aplicación (evidencia)
+        if: always()
+        run: docker logs juice-shop > reports/juice-shop.log 2>&1 || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: report-zap
+          path: |
+            reports/zap.xml
+            reports/zap.json
+            reports/zap.html
+            reports/juice-shop.log
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # 8 · GESTIÓN DE VULNERABILIDADES · envío automático a DefectDojo
+  # ---------------------------------------------------------------------------
+  defectdojo:
+    name: "8 · Envío a DefectDojo"
+    needs: [secrets, sast, sca, iac, image-scan, dast]
+    # always(): se envían los informes aunque un quality gate haya bloqueado
+    # (precisamente entonces es cuando más interesa registrar los hallazgos).
+    # En pull requests desde forks no hay acceso a los secretos, así que se omite.
+    if: >-
+      always() &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: report-*
+          path: reports
+          merge-multiple: true
+
+      - name: Importar informes (API v2 · reimport-scan)
+        env:
+          DD_URL: ${{ secrets.DD_URL }}
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_PRODUCT_TYPE: ${{ vars.DD_PRODUCT_TYPE || 'PAI4' }}
+          DD_PRODUCT: juice-shop
+        run: bash scripts/defectdojo-upload.sh reports
+
+  # ---------------------------------------------------------------------------
+  # 9 · ENTREGA · publicar la imagen en GHCR (solo si pasan los gates bloqueantes)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: "9 · Publicación de la imagen (GHCR)"
+    needs: [image-scan, dast]
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+          path: ${{ runner.temp }}
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Etiquetar y publicar
+        run: |
+          docker load -i "${{ runner.temp }}/juice-shop.tar"
+          IMG="ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA::7}"   # GHCR exige minúsculas
+          docker tag juice-shop:ci "$IMG"
+          docker push "$IMG"
+          echo "Publicada $IMG" >> "$GITHUB_STEP_SUMMARY"
